@@ -23,6 +23,7 @@ scnu-ledge-per/
    - **Windows:** `C:\Users\你的用户名\.workbuddy\skills\`
    - **Mac/Linux:** `~/.workbuddy/skills/`
 3. 重启 WorkBuddy 会话，技能即可生效。
+###作者仅在Workbubby上运行这个skill，其它环境请自行测试
 
 ## ⚙️ 环境依赖
 本技能依赖以下运行环境，请提前安装：
