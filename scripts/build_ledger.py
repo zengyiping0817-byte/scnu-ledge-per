@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from copy import deepcopy
 from datetime import date, datetime
@@ -45,6 +46,91 @@ from config import (  # noqa: E402
 HISTORY_FILE = "history.json"
 ASSETS_DIR = Path(__file__).parent.parent / "assets"
 TEMPLATE_DOCX = ASSETS_DIR / "template.docx"
+
+# PDF 字体规范要求的字体（缺失时 Word 会替换为系统默认中文字体）
+REQUIRED_FONTS = {
+    "方正仿宋_GBK": ["FZFSK.TTF"],
+    "方正黑体_GBK": ["FZHTK.TTF"],
+    "方正楷体_GBK": ["FZKTK.TTF"],
+    "方正小标宋_GBK": ["FZXBSK.TTF"],
+}
+# 字体文件可能的备用搜索目录（按顺序）
+FONT_SEARCH_DIRS = [
+    Path(r"D:\华师校团委组织部（南海）\字库文件"),
+]
+
+
+def _font_installed(family):
+    """检查字体是否已注册（HKLM / HKCU 字体表）或存在于系统/用户字体目录。"""
+    import winreg
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            key = winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
+        except OSError:
+            continue
+        i = 0
+        try:
+            while True:
+                try:
+                    name, val, _ = winreg.EnumValue(key, i)
+                except OSError:
+                    break
+                i += 1
+                if family in str(name):
+                    return True
+        finally:
+            winreg.CloseKey(key)
+    # 兜底：直接看字体目录里有没有对应文件
+    local_fonts = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts"
+    for d in (Path(r"C:\Windows\Fonts"), local_fonts):
+        for fn in REQUIRED_FONTS[family]:
+            if (d / fn).exists():
+                return True
+    return False
+
+
+def ensure_pdf_fonts():
+    """
+    确保 PDF 所需的方正 GBK 字体可用；缺失时尝试从备用目录按「用户级」安装
+    （复制到 %LOCALAPPDATA% 字体目录并写 HKCU 注册表，无需管理员权限）。
+    返回缺失且无法自动安装的字体列表。
+    """
+    import winreg
+    still_missing = []
+    user_font_dir = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts"
+    for family, files in REQUIRED_FONTS.items():
+        if _font_installed(family):
+            continue
+        src = None
+        for d in FONT_SEARCH_DIRS:
+            for fn in files:
+                if (d / fn).exists():
+                    src = d / fn
+                    break
+            if src:
+                break
+        if src is None:
+            still_missing.append(family)
+            continue
+        try:
+            user_font_dir.mkdir(parents=True, exist_ok=True)
+            dst = user_font_dir / src.name
+            if not dst.exists():
+                shutil.copy2(src, dst)
+            key = winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER,
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
+                0, winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(key, f"{family} (TrueType)", 0, winreg.REG_SZ, str(dst))
+            winreg.CloseKey(key)
+            print(f"[信息] 已自动安装字体：{family}（用户级）")
+        except Exception as e:
+            print(f"[警告] 自动安装字体 {family} 失败：{e}")
+            still_missing.append(family)
+    for family in still_missing:
+        print(f"[警告] 缺少字体「{family}」，PDF 中该字体会被替换为系统默认中文字体。"
+              f"请安装后重试（字库文件见 D:\\华师校团委组织部（南海）\\字库文件）。")
+    return still_missing
 
 
 # ===========================================================================
@@ -669,16 +755,13 @@ def build_rate_xlsx(out_path: Path, metric: str, cur_date, prev_date,
 # ===========================================================================
 def set_cell_text(cell, text, font="Times New Roman", size=11,
                   bold=None, color=None):
-    """改写单元格文本，尽量保留原 run 样式。"""
-    # 保留第一个 run 的样式作为模板
+    """改写单元格文本，清除模板残留 run 后再写入。"""
     para = cell.paragraphs[0]
-    if para.runs:
-        run = para.runs[0]
-        run.text = text
-        for extra in para.runs[1:]:
-            extra.text = ""
-    else:
-        run = para.add_run(text)
+    p = para._p
+    for child in list(p):
+        if child.tag.endswith('}r'):
+            p.remove(child)
+    run = para.add_run(text)
     run.font.name = font
     run.font.size = Pt(size)
     # 设置东亚字体
@@ -694,6 +777,10 @@ def set_cell_text(cell, text, font="Times New Roman", size=11,
         rFonts.set(qn('w:eastAsia'), '等线')
     else:
         rFonts.set(qn('w:eastAsia'), font)
+    # 破折号等东亚标点：hint=eastAsia 使其用东亚字体渲染（连成一条长横线，
+    # 与用户提供的台账样式一致；否则会退化为西文字体的两段短横）
+    if "—" in text or "–" in text:
+        rFonts.set(qn('w:hint'), 'eastAsia')
     if bold is not None:
         run.font.bold = bold
     if color is not None:
@@ -737,16 +824,22 @@ def build_word(out_path: Path, base_docx: Path, cur_date, prev_date,
     from docx.shared import RGBColor
     doc = Document(str(base_docx))
 
+    GREY = RGBColor(0x33, 0x33, 0x33)
+    BLACK = RGBColor(0, 0, 0)
+    RED = RGBColor(0xFF, 0, 0)
+    WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+
     def g(d, k):
         """取率：d 为 {initiate, complete} 结构。"""
         if not d:
             return None
         return d.get(k)
 
-    # 标题与副标题
-    for r in doc.paragraphs[0].runs[1:]:
+    # 标题与副标题：沿用模板原有字体设置，仅替换文本（不得改动标题字体）
+    p0 = doc.paragraphs[0]
+    for r in p0.runs[1:]:
         r.text = ""
-    doc.paragraphs[0].runs[0].text = f"{cur_date[:4]}年{WORD_TITLE}"
+    p0.runs[0].text = f"{cur_date[:4]}年{WORD_TITLE}"
 
     sub = doc.paragraphs[1]
     for r in sub.runs[1:]:
@@ -757,10 +850,11 @@ def build_word(out_path: Path, base_docx: Path, cur_date, prev_date,
 
     # 表头期次（第1行表头为深红底白字，模板中已存在，无需改色）
     prev_label = cn_date(prev_date) if prev_date else "—"
-    set_cell_text(table.rows[1].cells[1], prev_label, font="Times New Roman", size=11, bold=True)
-    set_cell_text(table.rows[1].cells[2], cn_date(cur_date), font="Times New Roman", size=11, bold=True)
-    set_cell_text(table.rows[1].cells[4], prev_label, font="Times New Roman", size=11, bold=True)
-    set_cell_text(table.rows[1].cells[5], cn_date(cur_date), font="Times New Roman", size=11, bold=True)
+    for cell, label in [(table.rows[1].cells[1], prev_label),
+                        (table.rows[1].cells[2], cn_date(cur_date)),
+                        (table.rows[1].cells[4], prev_label),
+                        (table.rows[1].cells[5], cn_date(cur_date))]:
+        set_cell_text(cell, label, font="Times New Roman", size=11, bold=True, color=WHITE)
 
     # 数据行集合（学校行 + 各学院，按本期发起率降序）
     data_rows = [(LEDGER_ROOT_LABEL, root_cur, root_prev, None)]
@@ -788,10 +882,6 @@ def build_word(out_path: Path, base_docx: Path, cur_date, prev_date,
 
     top_init = set(top3("initiate"))
     top_comp = set(top3("complete"))
-
-    GREY = RGBColor(0x33, 0x33, 0x33)
-    BLACK = RGBColor(0, 0, 0)
-    RED = RGBColor(0xFF, 0, 0)
 
     for i, (name, d_cur, d_prev, key) in enumerate(data_rows):
         row = table.rows[i + 2]
@@ -857,6 +947,9 @@ def convert_docx_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
     """
     docx_path = Path(docx_path).resolve()
     pdf_path = Path(pdf_path).resolve()
+
+    # 转换前确保 PDF 规范字体可用（缺失则尝试自动安装，失败给出警告）
+    ensure_pdf_fonts()
 
     # 方案 1：Microsoft Word COM
     try:
